@@ -3,32 +3,20 @@ use std::collections::HashSet;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Expr, ExprArray, Token,
+    Attribute, Expr, ExprArray, Ident, Token, braced,
     parse::{self, Parse, ParseStream},
     parse_macro_input,
+    token::Brace,
 };
 
-struct LayoutInput {
-    from: ExprArray,
-    _as: Token![as],
-    to: ExprArray,
-}
-
-impl Parse for LayoutInput {
-    fn parse(input: ParseStream) -> parse::Result<Self> {
-        let from: ExprArray = input.parse()?;
-        let _as: Token![as] = input.parse()?;
-        let to: ExprArray = input.parse()?;
-        Ok(LayoutInput { from, _as, to })
-    }
-}
-
 #[proc_macro]
-pub fn create_layout_macro(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as LayoutInput);
+pub fn layout_macro(input: TokenStream) -> TokenStream {
+    let layout = parse_macro_input!(input as Layout);
 
-    let from = extract_nested_arrays(input.from).unwrap();
-    let to = extract_nested_arrays(input.to).unwrap();
+    let attrs = layout.attrs;
+    let ident = layout.ident;
+    let from = extract_nested_arrays(layout.arm.from).unwrap();
+    let to = extract_nested_arrays(layout.arm.to).unwrap();
 
     let mut set = HashSet::new();
 
@@ -52,10 +40,8 @@ pub fn create_layout_macro(input: TokenStream) -> TokenStream {
             quote! { [ #( #idents ),* $(,)? ] }
         });
 
-        quote! { [ #( #pattern ),* $(,)? ] }
+        quote! { #( #pattern ),* $(,)? }
     };
-
-    // println!("Pattern: {}", pattern);
 
     let expansion = {
         let pattern = to.iter().map(|row| {
@@ -78,17 +64,52 @@ pub fn create_layout_macro(input: TokenStream) -> TokenStream {
         quote! { [ #( #pattern ),* ] }
     };
 
-    // println!("Expansion: {}", expansion);
-
     let macro_ = quote! {
-        macro_rules! layout_macro {
-            ( #pattern ) => { #expansion }
+        #( #attrs )*
+        macro_rules! #ident {
+            ( #pattern ) => { #expansion };
         }
     };
 
-    // println!("Macro: {}", &macro_);
-
     macro_.into()
+}
+
+struct Layout {
+    attrs: Vec<Attribute>,
+    _macro: Token![macro],
+    ident: Ident,
+    _brace: Brace,
+    arm: Arm,
+}
+
+impl Parse for Layout {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let content;
+
+        Ok(Layout {
+            attrs: input.call(Attribute::parse_outer)?,
+            _macro: input.parse()?,
+            ident: input.parse()?,
+            _brace: braced!(content in input),
+            arm: content.parse()?,
+        })
+    }
+}
+
+struct Arm {
+    from: ExprArray,
+    _fat_arrow: Token![=>],
+    to: ExprArray,
+}
+
+impl Parse for Arm {
+    fn parse(input: ParseStream) -> parse::Result<Self> {
+        Ok(Arm {
+            from: input.parse()?,
+            _fat_arrow: input.parse()?,
+            to: input.parse()?,
+        })
+    }
 }
 
 fn extract_nested_arrays(array: ExprArray) -> Option<Vec<Vec<Expr>>> {
@@ -96,7 +117,7 @@ fn extract_nested_arrays(array: ExprArray) -> Option<Vec<Vec<Expr>>> {
         .elems
         .into_iter()
         .map(|x| match x {
-            Expr::Array(y) => Some(y.elems.into_iter().collect()),
+            Expr::Array(a) => Some(a.elems.into_iter().collect()),
             _ => None,
         })
         .collect()

@@ -1,77 +1,90 @@
 use std::collections::HashSet;
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{
-    Attribute, Expr, ExprArray, Ident, Token, braced,
+    Attribute, Expr, Ident, Token, braced, bracketed,
     parse::{self, Parse, ParseStream},
     parse_macro_input,
-    token::Brace,
+    punctuated::Punctuated,
+    token::{Brace, Bracket},
 };
 
 #[proc_macro]
 pub fn layout_macro(input: TokenStream) -> TokenStream {
     let layout = parse_macro_input!(input as Layout);
 
+    match layout_macro_impl(layout) {
+        Ok(tokens) => tokens,
+        Err(err) => err.into_compile_error().into(),
+    }
+}
+
+fn layout_macro_impl(layout: Layout) -> syn::Result<TokenStream> {
     let attrs = layout.attrs;
-    let ident = layout.ident;
-    let from = extract_nested_arrays(layout.arm.from).unwrap();
-    let to = extract_nested_arrays(layout.arm.to).unwrap();
+    let macro_ident = layout.ident;
 
-    let mut set = HashSet::new();
+    let mut params = HashSet::new();
 
-    let pattern = {
-        let pattern = from.iter().map(|row| {
-            let idents = row.iter().map(|expr| {
-                // TODO: This sucks
-                let ident = if let Expr::Path(path) = expr {
-                    if let Some(ident) = path.path.get_ident() {
-                        ident
+    let foo = layout
+        .arm
+        .pattern
+        .items
+        .into_iter()
+        .map(|row| {
+            row.items
+                .into_iter()
+                .map(|Param { ident, .. }| {
+                    if params.insert(ident.to_string()) {
+                        Ok(ident)
                     } else {
-                        todo!()
+                        Err(syn::Error::new(ident.span(), "Parameter defined twice"))
                     }
-                } else {
-                    todo!()
-                };
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-                set.insert(ident.to_string());
-                quote! { $#ident:expr }
-            });
-            quote! { [ #( #idents ),* $(,)? ] }
-        });
+    let pattern = quote! { #( [#($#foo:expr),* $(,)? ]),* $(,)? };
 
-        quote! { #( #pattern ),* $(,)? }
-    };
+    println!("{}", &pattern);
 
-    let expansion = {
-        let pattern = to.iter().map(|row| {
-            let exprs = row.iter().map(|expr| {
-                // TODO: This sucks even more
-                if let Expr::Path(path) = expr {
-                    if let Some(ident) = path.path.get_ident() {
-                        if set.contains(&ident.to_string()) {
-                            return quote! { $#expr };
-                        }
+    let bar = layout
+        .arm
+        .expansion
+        .items
+        .into_iter()
+        .map(|row| {
+            row.items.into_iter().map(|item| match item {
+                Item::Param(Param { ident, .. }) => {
+                    if params.contains(&ident.to_string()) {
+                        quote! { $#ident }
+                    } else {
+                        quote_spanned!(
+                            ident.span() => compile_error!(concat!("Unidentified parameter: ", stringify!(#ident)))
+                        )
                     }
                 }
+                Item::Expr(expr) => quote! { #expr },
+            })
+            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
-                quote! { #expr }
-            });
+    let expansion = quote! { [#( [#(#bar),*] ),*] };
 
-            quote! { [ #( #exprs ),* ] }
-        });
-
-        quote! { [ #( #pattern ),* ] }
-    };
+    println!("{}", &expansion);
 
     let macro_ = quote! {
         #( #attrs )*
-        macro_rules! #ident {
+        macro_rules! #macro_ident {
             ( #pattern ) => { #expansion };
         }
     };
 
-    macro_.into()
+    println!("{}", &macro_);
+
+    Ok(macro_.into())
 }
 
 struct Layout {
@@ -97,28 +110,64 @@ impl Parse for Layout {
 }
 
 struct Arm {
-    from: ExprArray,
+    pattern: Matrix<Param>,
     _fat_arrow: Token![=>],
-    to: ExprArray,
+    expansion: Matrix<Item>,
 }
 
 impl Parse for Arm {
     fn parse(input: ParseStream) -> parse::Result<Self> {
         Ok(Arm {
-            from: input.parse()?,
+            pattern: input.parse()?,
             _fat_arrow: input.parse()?,
-            to: input.parse()?,
+            expansion: input.parse()?,
         })
     }
 }
 
-fn extract_nested_arrays(array: ExprArray) -> Option<Vec<Vec<Expr>>> {
-    array
-        .elems
-        .into_iter()
-        .map(|x| match x {
-            Expr::Array(a) => Some(a.elems.into_iter().collect()),
-            _ => None,
+type Matrix<T> = Array<Array<T>>;
+
+struct Array<T> {
+    _bracket: Bracket,
+    items: Punctuated<T, Token![,]>,
+}
+
+impl<T: Parse> Parse for Array<T> {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let content;
+
+        Ok(Self {
+            _bracket: bracketed!(content in input),
+            items: content.parse_terminated(T::parse, Token![,])?,
         })
-        .collect()
+    }
+}
+
+enum Item {
+    Param(Param),
+    Expr(Expr),
+}
+
+impl Parse for Item {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(if input.peek(Token![#]) {
+            Self::Param(input.parse()?)
+        } else {
+            Self::Expr(input.parse()?)
+        })
+    }
+}
+
+struct Param {
+    _pound: Token![#],
+    ident: Ident,
+}
+
+impl Parse for Param {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        Ok(Self {
+            _pound: input.parse()?,
+            ident: input.parse()?,
+        })
+    }
 }
